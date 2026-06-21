@@ -612,8 +612,10 @@ function toast(msg, isError){
 }
 function resizeImageFile(file, maxDim, quality, cb){
   const reader = new FileReader();
+  reader.onerror = () => { console.error('FileReader error', reader.error); toast('Impossibile leggere il file immagine.', true); };
   reader.onload = e => {
     const img = new Image();
+    img.onerror = () => { console.error('Image decode error per il file:', file.name, file.type); toast('Questo formato immagine non è supportato dal browser (prova JPG o PNG).', true); };
     img.onload = () => {
       let {width:w, height:h} = img;
       if(w > h && w > maxDim){ h = Math.round(h*maxDim/w); w = maxDim; }
@@ -648,6 +650,17 @@ let unsubMe=null, unsubPosts=null, unsubNotifs=null, unsubConvs=null, unsubActiv
 let searchDebounce = null;
 
 /* ---------------- Init ---------------- */
+window.addEventListener('error', e => {
+  console.error('Errore JS non gestito:', e.error || e.message);
+  toast('Errore JS: ' + (e.message || 'sconosciuto'), true);
+});
+window.addEventListener('unhandledrejection', e => {
+  const reason = e.reason;
+  console.error('Promise non gestita:', reason);
+  const msg = reason && (reason.code || reason.message) ? (reason.code || reason.message) : 'sconosciuto';
+  toast('Errore: ' + msg, true);
+});
+
 document.addEventListener('DOMContentLoaded', () => {
   buildAvatarPicker();
   buildLangGrid('langGrid');
@@ -792,12 +805,11 @@ function logout(){
 /* ---------------- Session lifecycle ---------------- */
 async function startSession(uid){
   stopSession();
+  let initialResolved = false;
   await new Promise(resolve => {
-    let resolved = false;
     unsubMe = dbFs.collection('users').doc(uid).onSnapshot(snap => {
       if(!snap.exists){
-        me = null;
-        if(!resolved){ resolved = true; resolve(); }
+        if(!initialResolved){ me = null; initialResolved = true; resolve(); }
         return;
       }
       me = snap.data();
@@ -808,18 +820,20 @@ async function startSession(uid){
       renderSuggestions();
       if(currentPage === 'feed') renderFeed();
       if(currentPage === 'messages') renderMessagesList();
-      if(!resolved){ resolved = true; resolve(); }
+      if(!initialResolved){ initialResolved = true; resolve(); }
     }, err => {
       console.error('users listener error', err);
-      me = null;
-      if(!resolved){ resolved = true; resolve(); }
+      // se l'errore arriva DOPO che il profilo era già stato caricato con successo,
+      // non lo azzeriamo: meglio tenere i dati che abbiamo che rompere l'app in silenzio
+      if(!initialResolved){ me = null; initialResolved = true; resolve(); }
+      else { toast('Connessione instabile con Firebase, riprova.', true); }
     });
   });
   if(!me) return;
   unsubPosts = dbFs.collection('posts').orderBy('ts','desc').limit(300).onSnapshot(snap => {
     allPosts = snap.docs.map(d => ({id:d.id, ...d.data()}));
     renderCurrentPageData();
-  }, err => console.error('posts listener', err));
+  }, err => { console.error('posts listener', err); toast('Errore caricamento post: ' + err.code, true); });
   unsubNotifs = dbFs.collection('users').doc(uid).collection('notifications').orderBy('ts','desc').limit(60).onSnapshot(snap => {
     myNotifications = snap.docs.map(d => ({id:d.id, ...d.data()}));
     updateNotifBadge();
@@ -834,6 +848,11 @@ function stopSession(){
   [unsubMe, unsubPosts, unsubNotifs, unsubConvs, unsubActiveConv, unsubProfile].forEach(u => { if(u) u(); });
   unsubMe=unsubPosts=unsubNotifs=unsubConvs=unsubActiveConv=unsubProfile=null;
   me=null; allPosts=[]; myConversations=[]; myNotifications=[]; activeConvUid=null; activeConvMessages=[];
+}
+function requireMe(){
+  if(me) return true;
+  toast('Sessione non disponibile: ricarica la pagina ed effettua di nuovo il login.', true);
+  return false;
 }
 
 async function getUserCached(uid){
@@ -1102,7 +1121,8 @@ async function renderSuggestions(){
   }).join('');
 }
 async function toggleFollow(targetUid){
-  if(!me || targetUid===me.uid) return;
+  if(!requireMe()) return;
+  if(targetUid===me.uid) return;
   const isFollowing = (me.following||[]).includes(targetUid);
   const batch = dbFs.batch();
   batch.update(dbFs.collection('users').doc(me.uid), {following: isFollowing ? FV.arrayRemove(targetUid) : FV.arrayUnion(targetUid)});
@@ -1209,7 +1229,7 @@ function renderMessagesList(){
 }
 async function openConversationFromProfile(targetUid){ goPage('messages'); openConversation(targetUid); }
 async function openConversation(targetUid){
-  if(!me) return;
+  if(!requireMe()) return;
   activeConvUid = targetUid;
   renderMessagesList();
   if(unsubActiveConv) unsubActiveConv();
@@ -1246,7 +1266,7 @@ function renderConversation(){
   document.getElementById('chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter') sendMessage(); });
 }
 async function sendMessage(){
-  if(!me || !activeConvUid) return;
+  if(!requireMe() || !activeConvUid) return;
   const input = document.getElementById('chatInput');
   const text = input.value.trim(); if(!text) return;
   input.value = '';
@@ -1326,14 +1346,14 @@ function renderProfile(){
 function hintFollowToChat(){ toast(t('followToChatHint')); }
 
 function openEditProfile(){
-  if(!me) return;
+  if(!requireMe()) return;
   document.getElementById('editAvatarPreview').src = me.avatar;
   document.getElementById('editNameInput').value = me.name;
   document.getElementById('editBioInput').value = me.bio || '';
   document.getElementById('modalEditProfile').classList.remove('hidden');
 }
 async function saveProfileEdit(){
-  if(!me) return;
+  if(!requireMe()) return;
   const name = document.getElementById('editNameInput').value.trim() || me.name;
   const bio = document.getElementById('editBioInput').value.trim();
   try{
@@ -1357,7 +1377,8 @@ function openCreatePost(){
 function triggerPostImage(){ document.getElementById('postImageInput').click(); }
 async function submitNewPost(){
   document.getElementById('createPostErrorBox').classList.add('hidden');
-  if(!pendingPostImage || !me) { toast(t('uploadFirst')); return; }
+  if(!pendingPostImage){ toast(t('uploadFirst')); return; }
+  if(!requireMe()) return;
   const caption = document.getElementById('postCaptionInput').value.trim();
   const btn = document.getElementById('submitPostBtn'); btn.disabled = true;
   try{
